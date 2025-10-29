@@ -1,0 +1,417 @@
+using System;
+using UnityEngine;
+using UnityEngine.InputSystem; // 新Input Systemのみ
+
+public class TriPlanarCTViewer : MonoBehaviour
+{
+    // ===== 入力（Resources） =====
+    [Header("Input (Resources)")]
+    [Tooltip("Assets/Resources/<ここ>/ に Axial 連番PNG")]
+    public string resourcesSubFolder = "CT";
+    public FilterMode filterMode = FilterMode.Bilinear;
+
+    // ===== ボクセル寸法（mm） =====
+    [Header("Voxel size (mm)")]
+    public float voxelSizeXmm = 0.683f;
+    public float voxelSizeYmm = 0.683f;
+    public float voxelSizeZmm = 0.683f;
+
+    // ===== スライスインデックス =====
+    [Header("Index (0-based)")]
+    public int indexX = 0; // Sagittal
+    public int indexY = 0; // Coronal
+    public int indexZ = 0; // Axial
+
+    // ===== Z順序/操作 =====
+    [Header("Z Order / Controls")]
+    [Tooltip("ロード直後にZスタック（頭↔尾）を反転させる")]
+    public bool reverseZStackOnLoad = false;
+    [Tooltip("Axial のスクロール方向だけ反転（見た目は変えない）")]
+    public bool reverseZScroll = false;
+
+    // ===== 面ごとの反転（UV or 生成時） =====
+    [Header("Per-Plane Flip (does NOT change stack order)")]
+    public bool flipAxialLR = false, flipAxialUD = false;
+    public bool flipCoronalLR = false, flipCoronalIS = false;
+    public bool flipSagittalAP = false, flipSagittalIS = false;
+
+    // ===== 表示/操作 =====
+    [Header("Options")]
+    public bool twoSided = true;
+    public bool wrapAround = true;
+    public bool useKeyboard = true;
+    public bool autoPlaceCameraOnPlay = true;
+    public float cameraDistanceFactor = 2.2f;
+
+    // ===== デバッグ/UI =====
+    [Header("UI")]
+    public bool showToolsWindow = true;  // 上のツール窓
+    public bool showSlidersWindow = true; // 下のスライダー窓
+
+    [Tooltip("ツール窓の初期位置")]
+    public Rect toolsWindowRect = new Rect(16, 16, 420, 170);
+    [Tooltip("スライダー窓の初期位置")]
+    public Rect slidersWindowRect = new Rect(16, 0, 560, 120); // y は Start で下端に配置
+
+    [Header("Debug")]
+    public bool debugLog = true;
+
+    // ===== 内部 =====
+    Texture2D[] _axialSlices = Array.Empty<Texture2D>(); // D
+    Color32[][] _axialPix; // [z][W*H]
+    int W, H, D;
+    int _lastX, _lastY, _lastZ;
+
+    GameObject _quadAxial;    // XY
+    GameObject _quadCoronal;  // XZ
+    GameObject _quadSagittal; // YZ
+
+    Texture2D _texCoronal;    // W x D
+    Texture2D _texSagittal;   // D x H
+
+    const float MIN_SIDE = 0.001f;
+
+    void Awake()
+    {
+        // Load axial stack
+        _axialSlices = Resources.LoadAll<Texture2D>(resourcesSubFolder);
+        Array.Sort(_axialSlices, (a,b) => string.CompareOrdinal(a.name, b.name));
+        if (reverseZStackOnLoad && _axialSlices.Length > 1) Array.Reverse(_axialSlices);
+
+        if (_axialSlices == null || _axialSlices.Length == 0)
+        {
+            Debug.LogError("[TriPlanar] No PNGs under Resources/" + resourcesSubFolder + "/");
+            return;
+        }
+
+        W = _axialSlices[0].width;
+        H = _axialSlices[0].height;
+        D = _axialSlices.Length;
+        _lastX = Mathf.Max(0, W-1);
+        _lastY = Mathf.Max(0, H-1);
+        _lastZ = Mathf.Max(0, D-1);
+
+        // 初期中央
+        indexX = _lastX/2; indexY = _lastY/2; indexZ = _lastZ/2;
+
+        // Read pixels (要 Read/Write Enabled)
+        _axialPix = new Color32[D][];
+        for (int z=0; z<D; z++)
+        {
+            var t = _axialSlices[z];
+            t.wrapMode = TextureWrapMode.Clamp;
+            t.filterMode = filterMode;
+            try { _axialPix[z] = t.GetPixels32(); }
+            catch (UnityException e)
+            {
+                Debug.LogError("[TriPlanar] PNG not readable. Enable Read/Write. " + e.Message);
+                return;
+            }
+        }
+
+        SpawnOrResetQuads();
+        ApplyAll(true);
+        RebuildCoronal(indexY);
+        RebuildSagittal(indexX);
+    }
+
+    void Start()
+    {
+        // スライダー窓を画面下部に初期配置
+        slidersWindowRect.y = Screen.height - slidersWindowRect.height - 16f;
+
+        if (autoPlaceCameraOnPlay) AutoPlaceCamera();
+    }
+
+    void Update()
+    {
+        if (!useKeyboard || D == 0) return;
+
+        var kb = Keyboard.current;
+        if (kb == null) return;
+
+        bool left  = kb.leftArrowKey.wasPressedThisFrame;
+        bool right = kb.rightArrowKey.wasPressedThisFrame;
+        bool up    = kb.upArrowKey.wasPressedThisFrame;
+        bool down  = kb.downArrowKey.wasPressedThisFrame;
+        bool a     = kb.aKey.wasPressedThisFrame;
+        bool d     = kb.dKey.wasPressedThisFrame;
+
+        // Z (Axial): ←/→
+        int zDirL = reverseZScroll ? +1 : -1;
+        int zDirR = reverseZScroll ? -1 : +1;
+        if (left)  StepZ(zDirL);
+        if (right) StepZ(zDirR);
+
+        // Y (Coronal): ↑/↓
+        if (up)   StepY(+1);
+        if (down) StepY(-1);
+
+        // X (Sagittal): A / D
+        if (a) StepX(-1);
+        if (d) StepX(+1);
+    }
+
+    // ==== 生成/マテリアル ====
+    void SpawnOrResetQuads()
+    {
+        if (_quadAxial) DestroyImmediate(_quadAxial);
+        if (_quadCoronal) DestroyImmediate(_quadCoronal);
+        if (_quadSagittal) DestroyImmediate(_quadSagittal);
+
+        _quadAxial = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        _quadAxial.name = "Quad_Axial_XY";
+        _quadAxial.transform.SetParent(transform, false);
+        SetDefaultMat(_quadAxial.GetComponent<Renderer>());
+
+        _quadCoronal = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        _quadCoronal.name = "Quad_Coronal_XZ";
+        _quadCoronal.transform.SetParent(transform, false);
+        _quadCoronal.transform.localRotation = Quaternion.Euler(-90f, 0f, 0f);
+        SetDefaultMat(_quadCoronal.GetComponent<Renderer>());
+
+        _quadSagittal = GameObject.CreatePrimitive(PrimitiveType.Quad);
+        _quadSagittal.name = "Quad_Sagittal_YZ";
+        _quadSagittal.transform.SetParent(transform, false);
+        _quadSagittal.transform.localRotation = Quaternion.Euler(0f, 90f, 0f);
+        SetDefaultMat(_quadSagittal.GetComponent<Renderer>());
+
+        _texCoronal = new Texture2D(W, D, TextureFormat.RGBA32, false, false);
+        _texCoronal.wrapMode = TextureWrapMode.Clamp; _texCoronal.filterMode = filterMode;
+
+        _texSagittal = new Texture2D(D, H, TextureFormat.RGBA32, false, false);
+        _texSagittal.wrapMode = TextureWrapMode.Clamp; _texSagittal.filterMode = filterMode;
+
+        _quadCoronal.GetComponent<Renderer>().material.mainTexture = _texCoronal;
+        _quadSagittal.GetComponent<Renderer>().material.mainTexture = _texSagittal;
+
+        // 仮塗り（描画経路確認）
+        var g = new Color32(200,200,200,255);
+        var bc = new Color32[W*D]; for(int i=0;i<bc.Length;i++) bc[i]=g; _texCoronal.SetPixels32(bc); _texCoronal.Apply();
+        var bs = new Color32[D*H]; for(int i=0;i<bs.Length;i++) bs[i]=g; _texSagittal.SetPixels32(bs); _texSagittal.Apply();
+    }
+
+    Shader PickUnlit(){ var s=Shader.Find("Universal Render Pipeline/Unlit"); if(s==null) s=Shader.Find("Unlit/Texture"); return s; }
+    void SetDefaultMat(Renderer r)
+    {
+        var m = new Material(PickUnlit());
+        if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", Color.white);
+        if (m.HasProperty("_Color"))     m.SetColor("_Color", Color.white);
+        if (twoSided)
+        {
+            if (m.HasProperty("_CullMode")) m.SetFloat("_CullMode", 0f);
+            if (m.HasProperty("_Cull"))     m.SetFloat("_Cull", 0f);
+        }
+        r.material = m;
+    }
+
+    // ==== 適用/更新 ====
+    void ApplyAll(bool forceRebuild)
+    {
+        if (D==0) return;
+
+        float sx = Mathf.Max(MIN_SIDE, W * (voxelSizeXmm * 0.001f));
+        float sy = Mathf.Max(MIN_SIDE, H * (voxelSizeYmm * 0.001f));
+        float sz = Mathf.Max(MIN_SIDE, D * (voxelSizeZmm * 0.001f));
+
+        _quadAxial.transform.localScale    = new Vector3(sx, sy, 1f);
+        _quadCoronal.transform.localScale  = new Vector3(sx, sz, 1f);
+        _quadSagittal.transform.localScale = new Vector3(sz, sy, 1f);
+
+        UpdateAxialPos(); UpdateCoronalPos(); UpdateSagittalPos();
+
+        // 1mm相当オフセットで重なり防止
+        float eps = 0.001f;
+        var pA=_quadAxial.transform.localPosition;    pA.z += +eps; _quadAxial.transform.localPosition=pA;
+        var pC=_quadCoronal.transform.localPosition;  pC.y += -eps; _quadCoronal.transform.localPosition=pC;
+        var pS=_quadSagittal.transform.localPosition; pS.x += -eps; _quadSagittal.transform.localPosition=pS;
+
+        ApplyAxialTexture(indexZ);
+        if (forceRebuild){ RebuildCoronal(indexY); RebuildSagittal(indexX); }
+    }
+
+    void StepX(int d){ int nx=indexX+d; if(wrapAround){ if(nx<0) nx=_lastX; if(nx>_lastX) nx=0;} else nx=Mathf.Clamp(nx,0,_lastX); if(nx!=indexX){ indexX=nx; RebuildSagittal(indexX); UpdateSagittalPos(); } }
+    void StepY(int d){ int ny=indexY+d; if(wrapAround){ if(ny<0) ny=_lastY; if(ny>_lastY) ny=0;} else ny=Mathf.Clamp(ny,0,_lastY); if(ny!=indexY){ indexY=ny; RebuildCoronal(indexY); UpdateCoronalPos(); } }
+    void StepZ(int d){ int nz=indexZ+d; if(wrapAround){ if(nz<0) nz=_lastZ; if(nz>_lastZ) nz=0;} else nz=Mathf.Clamp(nz,0,_lastZ); if(nz!=indexZ){ indexZ=nz; ApplyAxialTexture(indexZ); UpdateAxialPos(); } }
+
+    void UpdateSagittalPos(){ float sx=W*(voxelSizeXmm*0.001f); float px=(indexX*voxelSizeXmm*0.001f)-(sx*0.5f)+(voxelSizeXmm*0.001f*0.5f); var p=_quadSagittal.transform.localPosition; p.x=px; _quadSagittal.transform.localPosition=p; }
+    void UpdateCoronalPos(){ float sy=H*(voxelSizeYmm*0.001f); float py=(indexY*voxelSizeYmm*0.001f)-(sy*0.5f)+(voxelSizeYmm*0.001f*0.5f); var p=_quadCoronal.transform.localPosition; p.y=py; _quadCoronal.transform.localPosition=p; }
+    void UpdateAxialPos(){ float sz=D*(voxelSizeZmm*0.001f); float pz=(indexZ*voxelSizeZmm*0.001f)-(sz*0.5f)+(voxelSizeZmm*0.001f*0.5f); var p=_quadAxial.transform.localPosition; p.z=pz; _quadAxial.transform.localPosition=p; }
+
+    // ==== テクスチャ生成/貼付 ====
+    void ApplyAxialTexture(int z)
+    {
+        var r=_quadAxial.GetComponent<Renderer>();
+        var m=r.material;
+        m.mainTexture = _axialSlices[z];
+
+        // Axial はUVのみで反転
+        Vector2 scale = new Vector2(flipAxialLR ? -1f : 1f, flipAxialUD ? -1f : 1f);
+        Vector2 offset= new Vector2(flipAxialLR ?  1f : 0f, flipAxialUD ?  1f : 0f);
+        m.mainTextureScale = scale;
+        m.mainTextureOffset= offset;
+    }
+
+    // Coronal: (W x D) 画素(x,z) = axial[z][x,y0]
+    void RebuildCoronal(int y0)
+    {
+        if (_texCoronal==null||D==0) return;
+        y0=Mathf.Clamp(y0,0,_lastY);
+
+        Color32[] buf = new Color32[W*D];
+        for (int z=0; z<D; z++)
+        {
+            var src=_axialPix[z];
+            int srcRow=y0*W, dstRow=z*W;
+            if (!flipCoronalLR){
+                for (int x=0;x<W;x++) buf[dstRow+x]=src[srcRow+x];
+            } else {
+                for (int x=0;x<W;x++) buf[dstRow+x]=src[srcRow+(W-1-x)];
+            }
+        }
+        if (flipCoronalIS)
+        {
+            for (int zT=0,zB=D-1; zT<zB; zT++,zB--)
+            {
+                int a=zT*W, b=zB*W;
+                for(int x=0;x<W;x++){ var t=buf[a+x]; buf[a+x]=buf[b+x]; buf[b+x]=t; }
+            }
+        }
+        _texCoronal.SetPixels32(buf); _texCoronal.Apply(false,false);
+    }
+
+    // Sagittal: (D x H) 画素(z,y) = axial[z][x0,y]
+    void RebuildSagittal(int x0)
+    {
+        if (_texSagittal==null||D==0) return;
+        x0=Mathf.Clamp(x0,0,_lastX);
+        Color32[] buf = new Color32[D*H];
+
+        for (int y=0;y<H;y++)
+        {
+            int ySrc = (!flipSagittalAP) ? y : (_lastY - y); // 前↔後
+            int dstRow = y*D;
+            for (int z=0; z<D; z++)
+            {
+                var src=_axialPix[z];
+                buf[dstRow+z] = src[ySrc*W + x0];
+            }
+        }
+        if (flipSagittalIS)
+        {
+            for (int y=0;y<H;y++)
+            {
+                int row=y*D;
+                for (int l=0,r=D-1; l<r; l++,r--) { var t=buf[row+l]; buf[row+l]=buf[row+r]; buf[row+r]=t; }
+            }
+        }
+        _texSagittal.SetPixels32(buf); _texSagittal.Apply(false,false);
+    }
+
+    // ==== Zスタックのライブ反転（順序を物理的に入れ替える） ====
+    void ReverseZStackLive()
+    {
+        if (D <= 1) return;
+        Array.Reverse(_axialSlices);
+        Array.Reverse(_axialPix);
+        indexZ = _lastZ - indexZ; // 現在位置を対応させる
+        ApplyAxialTexture(indexZ);
+        RebuildCoronal(indexY);
+        RebuildSagittal(indexX);
+        UpdateAxialPos(); UpdateCoronalPos(); UpdateSagittalPos();
+        Debug.Log("[TriPlanar] Z stack reversed LIVE. indexZ -> " + indexZ);
+    }
+
+    // ==== カメラ配置 ====
+    void AutoPlaceCamera()
+    {
+        var cam = Camera.main; if (cam==null||D==0) return;
+        float sx=W*(voxelSizeXmm*0.001f), sy=H*(voxelSizeYmm*0.001f), sz=D*(voxelSizeZmm*0.001f);
+        float maxSize = Mathf.Max(sx,sy,sz);
+        float dist = maxSize*cameraDistanceFactor/Mathf.Tan(cam.fieldOfView*0.5f*Mathf.Deg2Rad);
+        Vector3 center = transform.position;
+        Vector3 dir = new Vector3(0.8f, 0.7f, 0.5f).normalized;
+        cam.transform.position = center - dir*dist;
+        cam.transform.LookAt(center, Vector3.up);
+    }
+
+    // ==== IMGUI ====
+    void OnGUI()
+    {
+        if (D == 0) return;
+
+        if (showToolsWindow)
+            toolsWindowRect = GUI.Window(1001, toolsWindowRect, DrawToolsWindow, "TriPlanar Tools");
+
+        if (showSlidersWindow)
+            slidersWindowRect = GUI.Window(1002, slidersWindowRect, DrawSlidersWindow, "Slices");
+    }
+
+    void DrawToolsWindow(int id)
+    {
+        float y = 24f, lh = 22f, pad = 6f;
+
+        // 行1：再構築・カメラ・Zスタック反転
+        if (GUI.Button(new Rect(8,y,128,lh), "Rebuild Quads")) { SpawnOrResetQuads(); ApplyAll(true); }
+        if (GUI.Button(new Rect(142,y,140,lh), "Auto Place Camera")) { AutoPlaceCamera(); }
+        if (GUI.Button(new Rect(288,y,120,lh), "Swap Z Stack")) { ReverseZStackLive(); }
+        y += lh + pad;
+
+        // 行2：Axial UV 反転
+        GUI.Box(new Rect(6,y-2,402,lh+4), GUIContent.none);
+        GUI.Label(new Rect(12,y,80,lh), "Axial:");
+        bool axLR = GUI.Toggle(new Rect(80,y,90,lh),  flipAxialLR, " Flip LR");
+        bool axUD = GUI.Toggle(new Rect(170,y,90,lh), flipAxialUD, " Flip UD");
+        if (axLR != flipAxialLR || axUD != flipAxialUD) { flipAxialLR=axLR; flipAxialUD=axUD; ApplyAxialTexture(indexZ); }
+        y += lh + pad;
+
+        // 行3：Coronal / Sagittal 反転
+        GUI.Box(new Rect(6,y-2,402,lh*2+10), GUIContent.none);
+
+        GUI.Label(new Rect(12,y,80,lh), "Coronal:");
+        bool coLR = GUI.Toggle(new Rect(80,y,90,lh),  flipCoronalLR, " Flip LR");
+        bool coIS = GUI.Toggle(new Rect(170,y,110,lh), flipCoronalIS, " Flip IS");
+        if (coLR != flipCoronalLR || coIS != flipCoronalIS) { flipCoronalLR=coLR; flipCoronalIS=coIS; RebuildCoronal(indexY); }
+        y += lh + 4f;
+
+        GUI.Label(new Rect(12,y,80,lh), "Sagittal:");
+        bool saAP = GUI.Toggle(new Rect(80,y,100,lh), flipSagittalAP, " Flip AP");
+        bool saIS = GUI.Toggle(new Rect(170,y,110,lh), flipSagittalIS, " Flip IS");
+        if (saAP != flipSagittalAP || saIS != flipSagittalIS) { flipSagittalAP=saAP; flipSagittalIS=saIS; RebuildSagittal(indexX); }
+        y += lh + pad;
+
+        // 行4：Z端ジャンプ＋操作感
+        if (GUI.Button(new Rect(8,y,120,lh), "Jump Z=0"))   { indexZ=0; ApplyAxialTexture(indexZ); UpdateAxialPos(); }
+        if (GUI.Button(new Rect(134,y,120,lh), "Jump Z=Last")){ indexZ=_lastZ; ApplyAxialTexture(indexZ); UpdateAxialPos(); }
+        reverseZScroll = GUI.Toggle(new Rect(264,y,140,lh), reverseZScroll, " Reverse Z Scroll");
+
+        GUI.DragWindow(new Rect(0,0, 10000, 20)); // タイトルバーでドラッグ可
+    }
+
+    void DrawSlidersWindow(int id)
+    {
+        float y = 24f, lh = 22f, pad = 8f;
+        float labelW = 130f, sliderW = slidersWindowRect.width - labelW - 20f;
+
+        // X
+        GUI.Label(new Rect(10,y, labelW, lh), $"X (0..{_lastX}) : {indexX}");
+        int newX = Mathf.RoundToInt(GUI.HorizontalSlider(new Rect(10+labelW, y+4, sliderW, lh), indexX, 0, _lastX));
+        if (newX != indexX) { indexX=newX; RebuildSagittal(indexX); UpdateSagittalPos(); }
+        y += lh + pad;
+
+        // Y
+        GUI.Label(new Rect(10,y, labelW, lh), $"Y (0..{_lastY}) : {indexY}");
+        int newY = Mathf.RoundToInt(GUI.HorizontalSlider(new Rect(10+labelW, y+4, sliderW, lh), indexY, 0, _lastY));
+        if (newY != indexY) { indexY=newY; RebuildCoronal(indexY); UpdateCoronalPos(); }
+        y += lh + pad;
+
+        // Z
+        GUI.Label(new Rect(10,y, labelW, lh), $"Z (0..{_lastZ}) : {indexZ}");
+        int guiZ = reverseZScroll ? (_lastZ - indexZ) : indexZ;
+        int guiNewZ = Mathf.RoundToInt(GUI.HorizontalSlider(new Rect(10+labelW, y+4, sliderW, lh), guiZ, 0, _lastZ));
+        int newZ = reverseZScroll ? (_lastZ - guiNewZ) : guiNewZ;
+        if (newZ != indexZ) { indexZ=newZ; ApplyAxialTexture(indexZ); UpdateAxialPos(); }
+
+        GUI.DragWindow(new Rect(0,0, 10000, 20)); // タイトルバーでドラッグ可
+    }
+}
