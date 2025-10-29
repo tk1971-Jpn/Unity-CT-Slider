@@ -1,0 +1,103 @@
+using UnityEngine;
+using UnityEngine.InputSystem; // ★ 新Input Systemのみ
+
+[RequireComponent(typeof(Camera))]
+[DefaultExecutionOrder(1000)]
+public class SimpleOrbitCamera : MonoBehaviour
+{
+    [Header("Target")]
+    public Transform target;
+    public Vector3 targetOffset = Vector3.zero;
+
+    [Header("Distance")]
+    public float distance = 3f;
+    public float minDistance = 0.3f;
+    public float maxDistance = 20f;
+
+    [Header("Speeds")]
+    public float orbitSpeed = 180f; // 右ドラッグ
+    public float panSpeed = 1.0f;   // 中ドラッグ
+    public float zoomSpeed = 2.0f;  // ホイール
+    public float pitchMin = -89f, pitchMax = 89f;
+
+    [Header("Keys/UI")]
+    public Key resetKey = Key.R;
+    public bool showUI = true;
+
+    float yaw = 45f, pitch = 35f;
+    Vector3 pan = Vector3.zero;
+
+    void Start()
+    {
+        var cam = GetComponent<Camera>();
+        cam.nearClipPlane = Mathf.Min(cam.nearClipPlane, 0.01f);
+        cam.farClipPlane  = Mathf.Max(cam.farClipPlane, 1000f);
+        if (target == null)
+        {
+            var t = GameObject.Find("TriPlanarViewer");
+            if (t) target = t.transform;
+        }
+        Apply();
+    }
+
+    void Update()
+    {
+        if (target == null) return;
+
+        var ms = Mouse.current;
+        var kb = Keyboard.current;
+        if (kb != null && kb[resetKey].wasPressedThisFrame) { yaw=45f; pitch=35f; pan=Vector3.zero; }
+
+        // 入力デバイスが無い環境を考慮
+        if (ms != null)
+        {
+            bool rmb = ms.rightButton.isPressed;
+            bool mmb = ms.middleButton.isPressed;
+            Vector2 d = ms.delta.ReadValue();
+            float dx = d.x;
+            float dy = d.y;
+            float scroll = ms.scroll.ReadValue().y / 120f; // おおよそ1刻み
+
+            if (rmb) // Orbit
+            {
+                yaw   += dx * orbitSpeed * Time.deltaTime;
+                pitch -= dy * orbitSpeed * Time.deltaTime;
+                pitch = Mathf.Clamp(pitch, pitchMin, pitchMax);
+            }
+
+            if (mmb) // Pan
+            {
+                var right = transform.right;
+                var up    = transform.up;
+                pan += (-right * dx + -up * dy) * panSpeed * distance * 0.002f;
+            }
+
+            if (Mathf.Abs(scroll) > 0.0001f) // Zoom
+            {
+                float factor = Mathf.Pow(1f - zoomSpeed * 0.1f, scroll);
+                distance = Mathf.Clamp(distance * factor, minDistance, maxDistance);
+            }
+        }
+
+        Apply();
+    }
+
+    void Apply()
+    {
+        Quaternion rot = Quaternion.Euler(pitch, yaw, 0f);
+        Vector3 focus = (target ? target.position : Vector3.zero) + targetOffset + pan;
+        transform.position = focus + rot * (Vector3.back * distance);
+        transform.rotation = rot;
+        transform.LookAt(focus, Vector3.up);
+    }
+
+    void OnGUI()
+    {
+        if (!showUI) return;
+        int x=12,y=12,w=210,h=24,p=4;
+        GUI.Box(new Rect(x-6,y-6,w+12,100), GUIContent.none);
+        if (GUI.Button(new Rect(x,y,w,h),"Reset (R)")) { yaw=45f; pitch=35f; pan=Vector3.zero; Apply(); } y+=h+p;
+        if (GUI.Button(new Rect(x,y,w,h),"View: Superior")) { pitch=70f; yaw=45f; Apply(); } y+=h+p;
+        if (GUI.Button(new Rect(x,y,w,h),"Rotate +45°")) { yaw+=45f; Apply(); }
+    }
+}
